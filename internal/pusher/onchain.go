@@ -133,7 +133,7 @@ func (p *OnChainPusher) PushPrice(symbol string, price float64, sourceInfo strin
 	return p.pushPriceToChain([]string{symbol}, []string{p.config.QuoteSymbol}, []float64{price}, sourceInfo)
 }
 
-// PushPrices 批量推送价格
+// PushPrices 批量推送价格（多个股票，统一来源）
 func (p *OnChainPusher) PushPrices(prices map[string]float64, sourceInfo string) error {
 	// 先打印控制台日志
 	p.printBatchConsoleLog(prices, sourceInfo)
@@ -153,6 +153,86 @@ func (p *OnChainPusher) PushPrices(prices map[string]float64, sourceInfo string)
 	}
 
 	return p.pushPriceToChain(bases, quotes, priceVals, sourceInfo)
+}
+
+// PushBatchPricesWithSources 批量推送价格（多个股票，每个股票可能有不同的来源）
+func (p *OnChainPusher) PushBatchPricesWithSources(prices map[string]PriceWithSource) error {
+	if len(prices) == 0 {
+		return nil
+	}
+
+	// 打印控制台日志
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("📦 [批量推送] 价格更新 - %d 个股票", len(prices))
+	log.Printf("   时间: %s", time.Now().Format("2006-01-02 15:04:05.000"))
+	log.Printf("   链ID: %s", p.config.ChainID)
+	if p.config.Enabled {
+		log.Printf("   模式: 链上推送")
+	} else {
+		log.Printf("   模式: 仅控制台打印")
+	}
+	for symbol, priceData := range prices {
+		log.Printf("   • %s: %.6f %s (来源: %s)", symbol, priceData.Price, p.config.QuoteSymbol, priceData.SourceInfo)
+	}
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+	// 如果未启用链上推送，仅打印
+	if !p.config.Enabled {
+		return nil
+	}
+
+	// 构建批量数据
+	var bases, quotes []string
+	var priceDecimals []math.LegacyDec
+	
+	for symbol, priceData := range prices {
+		bases = append(bases, symbol)
+		quotes = append(quotes, p.config.QuoteSymbol)
+		
+		// 将 float64 转换为 LegacyDec
+		priceStr := fmt.Sprintf("%.6f", priceData.Price)
+		priceDec := math.LegacyMustNewDecFromStr(priceStr)
+		priceDecimals = append(priceDecimals, priceDec)
+	}
+
+	// 构建批量消息
+	msg := &oracletypes.MsgRelayPriceFeedPrice{
+		Sender: p.senderAddr,
+		Base:   bases,
+		Quote:  quotes,
+		Price:  priceDecimals,
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 广播批量交易
+	_, result, err := p.chainClient.BroadcastMsg(ctx, txtypes.BroadcastMode_BROADCAST_MODE_SYNC, msg)
+	if err != nil {
+		return fmt.Errorf("批量推送失败: %w", err)
+	}
+
+	// 获取交易哈希
+	txHash := ""
+	if result != nil && result.TxResponse != nil {
+		txHash = result.TxResponse.TxHash
+		// 检查交易是否成功
+		if result.TxResponse.Code != 0 {
+			return fmt.Errorf("批量推送交易失败 (code=%d): %s", result.TxResponse.Code, result.TxResponse.RawLog)
+		}
+	}
+	log.Printf("[批量推送] ✅ 成功推送 %d 个股票 - TxHash: %s", len(prices), txHash)
+	return nil
+}
+
+// PriceWithSource 带来源信息的价格数据
+type PriceWithSource struct {
+	Price      float64   // 价格
+	SourceInfo string    // 数据来源信息
+	Timestamp  time.Time // 时间戳
 }
 
 // pushPriceToChain 执行链上推送

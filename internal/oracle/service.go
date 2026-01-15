@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"biya-oracle/internal/alert"
+	"biya-oracle/internal/batch"
 	"biya-oracle/internal/config"
 	"biya-oracle/internal/datasource/cex"
 	"biya-oracle/internal/datasource/gate"
@@ -23,14 +24,15 @@ import (
 
 // Service 报价服务
 type Service struct {
-	cfg           *config.Config
-	storage       *storage.RedisStorage
-	alertManager  *alert.LarkAlert
-	stateManager  *state.Manager
-	calculator    *price.Calculator
-	validator     *price.Validator
-	onChainPusher *pusher.OnChainPusher
-	throttler     *throttle.PriceThrottler // 价格瘦身器
+	cfg            *config.Config
+	storage        *storage.RedisStorage
+	alertManager   *alert.LarkAlert
+	stateManager   *state.Manager
+	calculator     *price.Calculator
+	validator      *price.Validator
+	onChainPusher  *pusher.OnChainPusher
+	throttler      *throttle.PriceThrottler   // 价格瘦身器（在批量收集时使用）
+	batchCollector *batch.PriceBatchCollector // 批量收集器
 
 	// 数据源客户端
 	cexClient  *cex.Client
@@ -40,16 +42,16 @@ type Service struct {
 
 	// 状态
 	mu                 sync.RWMutex
-	isReady            bool                         // 系统是否准备就绪（所有数据源连接成功后才为true）
-	lastPrices         map[string]float64           // 每个股票代币的最后推送价格（瘦身后的）
+	isReady            bool                         // 系统是否准备就绪
+	lastPrices         map[string]float64           // 每个股票代币的最后推送价格
 	cexQuotes          map[string]*cex.QuoteMessage // 最新CEX报价缓存
 	pythPrices         map[string]float64           // Pyth价格缓存
 	gatePrices         map[string]float64           // Gate价格缓存
 	closePrices        map[string]float64           // 收盘价缓存
-	bothOracleAlerted  map[string]bool              // 记录是否已发送"两个预言机都异常"告警（去重）
-	pythJumpAlerted    map[string]bool              // 记录Pyth是否已降权（日志去重）
-	gateJumpAlerted    map[string]bool              // 记录Gate是否已降权（日志去重）
-	closePriceAbnormal map[string]bool              // 记录收盘价是否异常（日志去重）
+	bothOracleAlerted  map[string]bool              // 记录是否已发送"两个预言机都异常"告警
+	pythJumpAlerted    map[string]bool              // 记录Pyth是否已降权
+	gateJumpAlerted    map[string]bool              // 记录Gate是否已降权
+	closePriceAbnormal map[string]bool              // 记录收盘价是否异常
 
 	// 控制
 	ctx    context.Context
@@ -71,7 +73,7 @@ func NewService(cfg *config.Config, storage *storage.RedisStorage) *Service {
 		})
 	}
 
-	// 创建价格瘦身器
+	// 创建价格瘦身器（在批量收集时使用，过滤不必要的价格更新）
 	priceThrottler := throttle.NewPriceThrottler(
 		cfg.Throttle.MinPushInterval,
 		cfg.Throttle.MaxPushInterval,
@@ -111,7 +113,95 @@ func NewService(cfg *config.Config, storage *storage.RedisStorage) *Service {
 	// 创建状态管理器（传入符号映射和致命错误回调）
 	svc.stateManager = state.NewManager(cexStatusClient, alertManager, symbolMappings, svc.handleFatalError)
 
+	// 创建批量收集器（1秒刷新间隔，最大缓冲100）
+	svc.batchCollector = batch.NewPriceBatchCollector(
+		1*time.Second,    // 1秒刷新间隔
+		100,              // 最大缓冲100个价格
+		svc.onBatchFlush, // 刷新回调
+	)
+
 	return svc
+}
+
+// onBatchFlush 批量刷新回调
+func (s *Service) onBatchFlush(prices map[string]batch.PriceWithSource) {
+	if len(prices) == 0 {
+		return
+	}
+
+	// 过滤掉被暂停的股票
+	filteredPrices := make(map[string]batch.PriceWithSource)
+	for symbol, priceData := range prices {
+		if !s.stateManager.IsPaused(symbol) {
+			filteredPrices[symbol] = priceData
+		}
+	}
+
+	if len(filteredPrices) == 0 {
+		log.Printf("[批量收集] 所有股票都被暂停，跳过推送")
+		return
+	}
+
+	// 批量推送到链上
+	// 将 batch.PriceWithSource 转换为 pusher.PriceWithSource
+	pushPrices := make(map[string]pusher.PriceWithSource)
+	for symbol, priceData := range filteredPrices {
+		pushPrices[symbol] = pusher.PriceWithSource{
+			Price:      priceData.Price,
+			SourceInfo: priceData.SourceInfo,
+			Timestamp:  priceData.Timestamp,
+		}
+	}
+
+	// 重试机制：最多重试3次，指数退避
+	maxRetries := 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// 指数退避：100ms, 200ms, 400ms
+			backoff := time.Duration(100*(1<<uint(attempt-1))) * time.Millisecond
+			log.Printf("[批量收集] 重试推送 (第 %d 次，等待 %v)...", attempt, backoff)
+			time.Sleep(backoff)
+		}
+
+		err := s.onChainPusher.PushBatchPricesWithSources(pushPrices)
+		if err == nil {
+			// 推送成功，更新状态
+			s.mu.Lock()
+			for symbol, priceData := range pushPrices {
+				// 更新瘦身器状态（确认推送完成）
+				s.throttler.ConfirmPush(symbol, priceData.Price)
+				// 更新最后推送价格（用于5%差异检测）
+				s.lastPrices[symbol] = priceData.Price
+			}
+			s.mu.Unlock()
+
+			if attempt > 0 {
+				log.Printf("[批量收集] ✅ 重试后推送成功")
+			}
+			return
+		}
+
+		lastErr = err
+		log.Printf("[批量收集] 批量推送失败 (尝试 %d/%d): %v", attempt+1, maxRetries, err)
+	}
+
+	// 所有重试都失败，发送告警
+	log.Printf("[批量收集] ❌ 批量推送失败，已重试 %d 次: %v", maxRetries, lastErr)
+
+	// 构建告警信息：列出所有失败的股票
+	symbols := make([]string, 0, len(pushPrices))
+	for symbol := range pushPrices {
+		symbols = append(symbols, symbol)
+	}
+
+	s.alertManager.SendAlert(types.AlertTypeDataSourceError, "", map[string]string{
+		"操作":   "批量链上推送",
+		"股票数量": fmt.Sprintf("%d", len(pushPrices)),
+		"股票列表": fmt.Sprintf("%v", symbols),
+		"错误":   lastErr.Error(),
+		"重试次数": fmt.Sprintf("%d", maxRetries),
+	})
 }
 
 // handleFatalError 处理致命错误（发送告警并终止程序）
@@ -138,7 +228,11 @@ func (s *Service) Start(ctx context.Context) error {
 
 	log.Println("========================================")
 	log.Println("  股票代币报价系统 启动中...")
+	log.Println("  模式: 批量收集推送（1秒刷新）")
 	log.Println("========================================")
+
+	// 启动批量收集器
+	s.batchCollector.Start()
 
 	// 设置数据源切换回调
 	s.stateManager.SetOnDataSourceChange(s.onDataSourceChange)
@@ -173,22 +267,22 @@ func (s *Service) Start(ctx context.Context) error {
 
 	log.Println("========================================")
 	log.Println("  系统启动完成，开始接收并推送价格")
-	log.Printf("  瘦身配置: 最小间隔=%ds, 最大间隔=%ds, 变动阈值=%.2f%%",
-		s.cfg.Throttle.MinPushInterval,
-		s.cfg.Throttle.MaxPushInterval,
-		s.cfg.Throttle.PriceChangeThreshold*100)
 	log.Println("========================================")
 
 	return nil
 }
 
-// Stop 停止服务
+// Stop 停止服务（优雅退出）
 func (s *Service) Stop() {
 	log.Println("[服务] 正在停止...")
 
+	// 步骤1: 取消所有 context
+	// 这会自动停止所有使用 ctx 的 goroutine（包括数据源的重连逻辑）
 	s.cancel()
+	log.Println("[服务] 已发送停止信号")
 
-	// 停止数据源
+	// 步骤2: 停止数据源（关闭 WebSocket，不再接收新数据）
+	// 此时断线重连逻辑会因为 ctx 取消而自动停止
 	if s.cexClient != nil {
 		s.cexClient.Stop()
 	}
@@ -198,16 +292,29 @@ func (s *Service) Stop() {
 	if s.gateClient != nil {
 		s.gateClient.Stop()
 	}
+	log.Println("[服务] 数据源已停止（不再接收新数据）")
 
+	// 步骤3: 停止状态管理（不再轮询市场状态）
 	s.stateManager.Stop()
+	log.Println("[服务] 状态管理已停止")
 
-	// 关闭链上推送器连接
+	// 步骤4: 停止批量收集器（会触发最后一次 flush）
+	// 此时已经在程序中的数据会被正常处理并推送到链上
+	// batchCollector.Stop() 会等待所有 flush 操作完成（包括异步的 onFlush 回调）
+	// 最多等待35秒（链上推送最多30秒超时），所以这里返回时推送应该已经完成或超时
+	s.batchCollector.Stop()
+	log.Println("[服务] 批量收集器已停止（所有推送已完成）")
+
+	// 步骤5: 关闭推送器连接
+	// 此时所有推送应该已经完成（batchCollector.Stop() 已经等待了推送完成）
 	if s.onChainPusher != nil {
 		if err := s.onChainPusher.Close(); err != nil {
 			log.Printf("[服务] 关闭链上推送器失败: %v", err)
 		}
 	}
+	log.Println("[服务] 链上推送器已关闭")
 
+	// 步骤6: 等待所有 goroutine 完成
 	s.wg.Wait()
 
 	log.Println("[服务] 已停止")
@@ -355,7 +462,7 @@ func (s *Service) handleCEXQuote(quote *cex.QuoteMessage) {
 		// 推送价格（来源: CEX + 市场状态）
 		// 注：正常价格推送不检查5%阈值，5%阈值只在数据源切换时检查
 		sourceInfo := types.FormatCEXSourceInfo(quote.MarketStatus)
-		s.pushPrice(symbol, formattedPrice, sourceInfo)
+		s.collectPrice(symbol, formattedPrice, sourceInfo, false)
 	}
 
 	// 注：CEX报价只在内存中缓存（s.cexQuotes），不频繁写Redis
@@ -601,8 +708,9 @@ func (s *Service) onDataSourceChange(oldSource, newSource types.DataSource, symb
 		}
 	}
 
-	// 通过5%检测，强制立即推送（数据源切换时忽略瘦身限制）
-	s.tryPushPrice(symbol, newPrice, sourceInfo, true)
+	// 通过5%检测，收集价格并强制立即推送（数据源切换时忽略瘦身限制）
+	s.collectPrice(symbol, newPrice, sourceInfo, true)
+	s.batchCollector.ForceFlush()
 }
 
 // captureClosePrice 捕获单个股票的收盘价（从CEX切换到加权时）
@@ -763,57 +871,26 @@ func (s *Service) calculateAndPushWeightedPrice(symbol string) {
 		}
 	}
 
-	// 推送价格（来源: 加权合成）
+	// 收集价格（来源: 加权合成）
 	// 注：正常价格推送不检查5%阈值，5%阈值只在数据源切换时检查
-	s.pushPrice(symbol, weighted.Price, weighted.SourceInfo())
+	s.collectPrice(symbol, weighted.Price, weighted.SourceInfo(), false)
 }
 
-// tryPushPrice 尝试推送价格（经过瘦身器判断）
+// collectPrice 收集价格到批量缓冲区
+// 替代原来的直接推送逻辑
 // forceImmediate: 是否强制立即推送（如数据源切换时）
-func (s *Service) tryPushPrice(symbol string, priceValue float64, sourceInfo string, forceImmediate bool) {
-	// 检查该股票是否被暂停报价
-	if s.stateManager.IsPaused(symbol) {
-		// 股票被暂停，不推送
-		return
-	}
-
-	// 通过瘦身器判断是否应该推送
+func (s *Service) collectPrice(symbol string, priceValue float64, sourceInfo string, forceImmediate bool) {
+	// 使用瘦身逻辑判断是否应该推送
 	decision := s.throttler.ShouldPush(symbol, priceValue, sourceInfo, forceImmediate)
 
 	if !decision.ShouldPush {
-		// 不推送，跳过
+		// 瘦身逻辑判断不需要推送，跳过
 		return
 	}
 
-	// 执行实际推送
-	s.doPushPrice(symbol, priceValue, sourceInfo)
-
-	// 确认推送完成，更新瘦身器状态
-	s.throttler.ConfirmPush(symbol, priceValue)
-}
-
-// doPushPrice 实际执行价格推送
-// sourceInfo: 数据来源信息，如 "CEX（盘中）" 或 "加权合成（CEX40%+Pyth30%+Gate30%）"
-func (s *Service) doPushPrice(symbol string, priceValue float64, sourceInfo string) {
-	// 更新最后价格（瘦身后的有效价格）
-	s.mu.Lock()
-	s.lastPrices[symbol] = priceValue
-	s.mu.Unlock()
-
-	// 推送到链上
-	if err := s.onChainPusher.PushPrice(symbol, priceValue, sourceInfo); err != nil {
-		log.Printf("[服务] 推送价格失败: %v", err)
-		s.alertManager.SendAlert(types.AlertTypeDataSourceError, symbol, map[string]string{
-			"操作": "链上推送",
-			"原因": err.Error(),
-		})
-	}
-}
-
-// pushPrice 推送价格（带瘦身，非强制）
-// 保留此方法以保持向后兼容
-func (s *Service) pushPrice(symbol string, priceValue float64, sourceInfo string) {
-	s.tryPushPrice(symbol, priceValue, sourceInfo, false)
+	// 添加到批量收集器（自动去重）
+	// 注意：lastPrices 在批量推送成功后才更新，确保记录的是"最后成功推送的价格"
+	s.batchCollector.AddPrice(symbol, priceValue, sourceInfo)
 }
 
 // formatFloat 格式化浮点数
