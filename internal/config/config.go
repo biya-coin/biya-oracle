@@ -58,6 +58,7 @@ type LarkConfig struct {
 
 // OnChainConfig 链上推送配置
 type OnChainConfig struct {
+	Enabled        bool   `yaml:"enabled"`         // 是否启用链上推送（false时仅控制台打印）
 	ChainID        string `yaml:"chain_id"`
 	TMEndpoint     string `yaml:"tm_endpoint"`
 	GRPCEndpoint   string `yaml:"grpc_endpoint"`
@@ -68,6 +69,9 @@ type OnChainConfig struct {
 	Password       string `yaml:"password"`
 	PrivateKey     string `yaml:"private_key"`
 	QuoteSymbol    string `yaml:"quote_symbol"`
+	GasLimit       uint64 `yaml:"gas_limit"`       // Gas限制
+	GasPrice       string `yaml:"gas_price"`       // Gas价格（如 "500000000inj"）
+	AccountPrefix  string `yaml:"account_prefix"`  // 账户前缀（如 "inj"）
 }
 
 // StockTokenConfig 股票代币配置

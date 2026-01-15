@@ -32,6 +32,7 @@ throttle:
 
 # 链上推送配置
 onchain:
+  enabled: true # 是否启用链上推送（false时仅控制台打印，true时推送到链上）
   chain_id: "injective-1" # 链ID
   tm_endpoint: "tcp://123.58.219.178:26657" # Tendermint RPC端点
   grpc_endpoint: "123.58.219.178:9900" # gRPC端点
@@ -42,6 +43,9 @@ onchain:
   password: "12345678" # 账户密码
   private_key: "88358fe1b3e463ca53eaaa522bc4bd75db8a7c62c6339b32aad80ee26d20b685" # 私钥（可选，如果提供则使用私钥，否则使用keyring）
   quote_symbol: "USDT" # 计价币种符号（用于 PriceFeed Oracle 授权，与授权提案中的 quote 参数一致）
+  gas_limit: 200000 # Gas限制
+  gas_price: "500000000inj" # Gas价格
+  account_prefix: "inj" # 账户地址前缀
 
 # 股票代币配置
 # 每个股票代币需要配置三个数据源的参数：

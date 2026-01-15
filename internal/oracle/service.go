@@ -78,18 +78,23 @@ func NewService(cfg *config.Config, storage *storage.RedisStorage) *Service {
 		cfg.Throttle.PriceChangeThreshold,
 	)
 
+	// 创建链上推送器
+	onChainPusher, err := pusher.NewOnChainPusher(cfg.OnChain)
+	if err != nil {
+		log.Printf("[服务] ⚠️ 链上推送器初始化失败: %v，将使用仅打印模式", err)
+		// 创建一个禁用的推送器作为 fallback
+		fallbackCfg := cfg.OnChain
+		fallbackCfg.Enabled = false
+		onChainPusher, _ = pusher.NewOnChainPusher(fallbackCfg)
+	}
+
 	svc := &Service{
-		cfg:          cfg,
-		storage:      storage,
-		alertManager: alertManager,
-		calculator:   price.NewCalculator(),
-		validator:    price.NewValidator(),
-		onChainPusher: pusher.NewOnChainPusher(
-			cfg.OnChain.ChainID,
-			cfg.OnChain.TMEndpoint,
-			cfg.OnChain.GRPCEndpoint,
-			cfg.OnChain.QuoteSymbol,
-		),
+		cfg:                cfg,
+		storage:            storage,
+		alertManager:       alertManager,
+		calculator:         price.NewCalculator(),
+		validator:          price.NewValidator(),
+		onChainPusher:      onChainPusher,
 		throttler:          priceThrottler,
 		cexStatus:          cexStatusClient,
 		lastPrices:         make(map[string]float64),
@@ -195,6 +200,13 @@ func (s *Service) Stop() {
 	}
 
 	s.stateManager.Stop()
+
+	// 关闭链上推送器连接
+	if s.onChainPusher != nil {
+		if err := s.onChainPusher.Close(); err != nil {
+			log.Printf("[服务] 关闭链上推送器失败: %v", err)
+		}
+	}
 
 	s.wg.Wait()
 

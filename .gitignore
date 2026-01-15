@@ -14,6 +14,7 @@
 .idea/
 .vscode/
 .DS_Store
+injective_data/*
 
 # Go
 /vendor/
