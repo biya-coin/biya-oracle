@@ -1,0 +1,69 @@
+# 股票代币报价系统配置文件
+
+# Redis配置
+redis:
+  addr: "localhost:6379"
+  password: ""
+  db: 0
+
+# CEX配置
+cex:
+  market_status_url: "https://japi-stock-quote.biya.in/market/get"
+  stock_status_url: "https://japi-stock-quote.biya.in/quote/briefs"
+  ws_base_url: "wss://market-ws.biya.in/market/subscribe"
+
+# Pyth配置
+pyth:
+  sse_url: "https://hermes.pyth.network/v2/updates/price/stream"
+
+# Gate配置
+gate:
+  ws_url: "wss://api.gateio.ws/ws/v4/"
+
+# Lark告警配置
+lark:
+  webhook_url: "https://open.larksuite.com/open-apis/bot/v2/hook/5d5f6b52-cc10-4d37-a278-4af224288a9a"
+
+# 价格瘦身配置
+throttle:
+  min_push_interval: 1      # 最小推送间隔（秒）
+  max_push_interval: 3      # 最大推送间隔（秒）
+  price_change_threshold: 0.003  # 价格变动阈值（0.3%）
+
+# 链上推送配置
+onchain:
+  chain_id: "injective-1" # 链ID
+  tm_endpoint: "tcp://123.58.219.178:26657" # Tendermint RPC端点
+  grpc_endpoint: "123.58.219.178:9900" # gRPC端点
+  lcd_endpoint: "http://123.58.219.178:10337" # LCD端点
+  keyring_home: "/home/ubuntu/biyachain-core/.injectived" # Keyring目录
+  keyring_backend: "file" # Keyring后端
+  account_name: "wcq" # 账户名称
+  password: "12345678" # 账户密码
+  private_key: "88358fe1b3e463ca53eaaa522bc4bd75db8a7c62c6339b32aad80ee26d20b685" # 私钥（可选，如果提供则使用私钥，否则使用keyring）
+  quote_symbol: "USDT" # 计价币种符号（用于 PriceFeed Oracle 授权，与授权提案中的 quote 参数一致）
+
+# 股票代币配置
+# 每个股票代币需要配置三个数据源的参数：
+# - cex_symbol: CEX使用的股票代码（用于WebSocket订阅和状态查询），如 "AAPL", "NVDA"
+# - pyth_symbol: Pyth使用的股票代币代码，如 "AAPLX", "NVDAX"
+# - pyth_feed_id: Pyth Feed ID
+# - gate_pair: Gate.io交易对，如 "AAPLX_USDT", "NVDAX_USDT"
+stock_tokens:
+  - cex_symbol: "AAPL"
+    pyth_symbol: "AAPLX"
+    pyth_feed_id: "978e6cc68a119ce066aa830017318563a9ed04ec3a0a6439010fc11296a58675"
+    gate_pair: "AAPLX_USDT"
+    base_symbol: "AAPLX" # 用于 PriceFeed Oracle 授权的 base 符号（与授权提案中的 base 参数一致）
+
+  - cex_symbol: "NVDA"
+    pyth_symbol: "NVDAX"
+    pyth_feed_id: "4244d07890e4610f46bbde67de8f43a4bf8b569eebe904f136b469f148503b7f"
+    gate_pair: "NVDAX_USDT"
+    base_symbol: "NVDAX" # 用于 PriceFeed Oracle 授权的 base 符号（与授权提案中的 base 参数一致）
+
+  - cex_symbol: "TSLA"
+    pyth_symbol: "TSLAX"
+    pyth_feed_id: "47a156470288850a440df3a6ce85a55917b813a19bb5b31128a33a986566a362"
+    gate_pair: "TSLAX_USDT"
+    base_symbol: "TSLAX" # 用于 PriceFeed Oracle 授权的 base 符号（与授权提案中的 base 参数一致）

@@ -1,0 +1,23 @@
+# build artifacts
+/bin/
+/dist/
+/tmp/
+/logs/
+*.log
+*.out
+
+# local env/config
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Go
+/vendor/
+*.test
+coverage.*
+
+
