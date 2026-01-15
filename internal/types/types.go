@@ -31,9 +31,13 @@ const (
 )
 
 // IsTrading 是否为交易时段
+// 注意：这里直接比较字符串值，而不是通过常量
+// 这样可以确保即使常量的值被错误修改，也能正确判断
 func (m MarketStatus) IsTrading() bool {
-	switch m {
-	case MarketStatusPreHourTrading, MarketStatusTrading, MarketStatusPostHourTrading, MarketStatusOvernight:
+	statusStr := string(m)
+	// 直接比较字符串值，而不是通过常量
+	switch statusStr {
+	case "pre_hour_trading", "trading", "post_hour_trading", "overnight_trading":
 		return true
 	default:
 		return false
