@@ -9,6 +9,7 @@ redis:
 # CEX配置
 cex:
   market_status_url: "https://japi-stock-quote.biya.in/market/get"
+  # market_status_url: "http://localhost:8888/market/get"
   stock_status_url: "https://japi-stock-quote.biya.in/quote/briefs"
   ws_base_url: "wss://market-ws.biya.in/market/subscribe"
 
